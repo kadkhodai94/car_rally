@@ -1,0 +1,163 @@
+name: Build Flutter Android From Latest ZIP
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build-android:
+    name: Build APK and AAB
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install unzip and tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip rsync
+
+      - name: Detect latest ZIP and extract project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Searching for ZIP files in repository..."
+
+          mapfile -t ZIP_FILES < <(find . -maxdepth 2 -type f -name "*.zip" \
+            ! -path "./build/*" \
+            ! -path "./.git/*" \
+            ! -path "./extracted_project/*" \
+            | sort)
+
+          if [ "${#ZIP_FILES[@]}" -eq 0 ]; then
+            echo "No ZIP file found. Checking if repository itself is a Flutter project..."
+
+            if [ -f "pubspec.yaml" ]; then
+              echo "Flutter project found in repository root."
+              mkdir -p extracted_project
+              rsync -a \
+                --exclude=".git" \
+                --exclude="build" \
+                --exclude="extracted_project" \
+                ./ extracted_project/
+              exit 0
+            fi
+
+            echo "ERROR: No ZIP file found and no pubspec.yaml exists in repository root."
+            exit 1
+          fi
+
+          echo "Found ZIP files:"
+          printf '%s\n' "${ZIP_FILES[@]}"
+
+          LATEST_ZIP=""
+          LATEST_TIME=0
+
+          for ZIP in "${ZIP_FILES[@]}"; do
+            FILE_TIME=$(git log -1 --format=%ct -- "$ZIP" 2>/dev/null || echo 0)
+
+            if [ "$FILE_TIME" = "" ] || [ "$FILE_TIME" = "0" ]; then
+              FILE_TIME=$(stat -c %Y "$ZIP")
+            fi
+
+            echo "$ZIP => $FILE_TIME"
+
+            if [ "$FILE_TIME" -ge "$LATEST_TIME" ]; then
+              LATEST_TIME="$FILE_TIME"
+              LATEST_ZIP="$ZIP"
+            fi
+          done
+
+          echo "Latest ZIP selected: $LATEST_ZIP"
+
+          rm -rf extracted_project zip_extract_tmp
+          mkdir -p zip_extract_tmp extracted_project
+
+          unzip -q "$LATEST_ZIP" -d zip_extract_tmp
+
+          echo "Searching for Flutter project inside ZIP..."
+
+          PUBSPEC_PATH=$(find zip_extract_tmp -type f -name "pubspec.yaml" | head -n 1 || true)
+
+          if [ -z "$PUBSPEC_PATH" ]; then
+            echo "ERROR: pubspec.yaml not found inside ZIP."
+            echo "ZIP must contain a Flutter project."
+            exit 1
+          fi
+
+          PROJECT_DIR=$(dirname "$PUBSPEC_PATH")
+          echo "Flutter project found at: $PROJECT_DIR"
+
+          rsync -a "$PROJECT_DIR"/ extracted_project/
+
+          echo "Project extracted successfully."
+
+      - name: Show project files
+        working-directory: extracted_project
+        run: |
+          echo "Current project directory:"
+          pwd
+          echo "Files:"
+          ls -la
+          echo "pubspec.yaml:"
+          cat pubspec.yaml
+
+      - name: Ensure Android project exists
+        working-directory: extracted_project
+        run: |
+          set -euo pipefail
+
+          if [ ! -d "android" ]; then
+            echo "Android folder not found. Creating Android platform files..."
+            flutter create . --platforms=android
+          else
+            echo "Android folder exists."
+          fi
+
+      - name: Get Flutter dependencies
+        working-directory: extracted_project
+        run: flutter pub get
+
+      - name: Run Flutter analyze
+        working-directory: extracted_project
+        continue-on-error: true
+        run: flutter analyze
+
+      - name: Build release APK
+        working-directory: extracted_project
+        run: flutter build apk --release --build-name=1.0.0 --build-number=1
+
+      - name: Build release AAB
+        working-directory: extracted_project
+        run: flutter build appbundle --release --build-name=1.0.0 --build-number=1
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-apk
+          path: extracted_project/build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Upload AAB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-aab
+          path: extracted_project/build/app/outputs/bundle/release/app-release.aab
