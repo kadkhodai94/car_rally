@@ -47,7 +47,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y unzip zip curl python3
+          sudo apt-get install -y unzip zip curl python3 rsync
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
@@ -72,7 +72,7 @@ jobs:
           if [ -z "$SDKMANAGER" ]; then
             echo "ERROR: sdkmanager not found."
             echo "ANDROID_HOME=$ANDROID_HOME"
-            find "$ANDROID_HOME" -maxdepth 5 -type f -name sdkmanager || true
+            find "$ANDROID_HOME" -maxdepth 6 -type f -name sdkmanager || true
             exit 1
           fi
 
@@ -81,11 +81,20 @@ jobs:
           "$SDKMANAGER" \
             "platform-tools" \
             "build-tools;34.0.0" \
+            "build-tools;35.0.1" \
             "platforms;android-34" \
-            "cmdline-tools;latest"
+            "platforms;android-35" \
+            "cmdline-tools;latest" \
+            "cmake;3.10.2.4988404" || true
 
           echo "Installed Android SDK packages:"
-          "$SDKMANAGER" --list_installed | head -n 100
+          "$SDKMANAGER" --list_installed | head -n 150
+
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls -lah "$ANDROID_HOME"
+          ls -lah "$ANDROID_HOME/platform-tools" || true
+          ls -lah "$ANDROID_HOME/build-tools" || true
+          ls -lah "$ANDROID_HOME/platforms" || true
 
       - name: Resolve latest Godot project ZIP
         id: resolve
@@ -202,10 +211,11 @@ jobs:
           unzip -q -o "$TEMPLATES_TPZ" -d "$GODOT_DIR/templates_unpack"
 
           TEMPLATE_TARGET="$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.${GODOT_STATUS}"
+          rm -rf "$TEMPLATE_TARGET"
           mkdir -p "$TEMPLATE_TARGET"
           cp -R "$GODOT_DIR/templates_unpack/templates/"* "$TEMPLATE_TARGET/"
 
-          echo "GODOT_BIN=$GODOT_BIN"
+          echo "Godot version:"
           "$GODOT_BIN" --version
 
           echo "Template target:"
@@ -224,7 +234,15 @@ jobs:
             exit 1
           fi
 
+          if [ ! -f "$TEMPLATE_TARGET/android_source.zip" ]; then
+            echo "ERROR: android_source.zip template not found."
+            exit 1
+          fi
+
           echo "GODOT_TEMPLATE_TARGET=$TEMPLATE_TARGET" >> "$GITHUB_ENV"
+          echo "ANDROID_DEBUG_TEMPLATE=$TEMPLATE_TARGET/android_debug.apk" >> "$GITHUB_ENV"
+          echo "ANDROID_RELEASE_TEMPLATE=$TEMPLATE_TARGET/android_release.apk" >> "$GITHUB_ENV"
+          echo "ANDROID_SOURCE_ZIP=$TEMPLATE_TARGET/android_source.zip" >> "$GITHUB_ENV"
 
       - name: Create Android debug keystore
         shell: bash
@@ -255,7 +273,7 @@ jobs:
           echo "Debug keystore:"
           ls -lah "$KEYSTORE_PATH"
 
-      - name: Patch Godot project and export preset
+      - name: Patch Godot project and install Android build template
         shell: bash
         run: |
           set -euo pipefail
@@ -267,6 +285,21 @@ jobs:
           echo "Project file: $PROJECT_FILE"
           echo "Preset file: $PRESET_FILE"
 
+          echo "Installing Android build template into project..."
+          rm -rf "$PROJECT_DIR/android"
+          mkdir -p "$PROJECT_DIR/android/build"
+          unzip -q -o "$ANDROID_SOURCE_ZIP" -d "$PROJECT_DIR/android/build"
+
+          echo "Android build template files:"
+          find "$PROJECT_DIR/android/build" -maxdepth 3 -type f | head -n 80
+
+          if [ ! -f "$PROJECT_DIR/android/build/build.gradle" ] && [ ! -f "$PROJECT_DIR/android/build/build.gradle.kts" ]; then
+            echo "ERROR: Android build template was not installed correctly."
+            echo "android_source.zip content may have a different structure."
+            find "$PROJECT_DIR/android" -maxdepth 5 -type f | head -n 150
+            exit 1
+          fi
+
           python3 <<'PY'
           from pathlib import Path
           import os
@@ -274,9 +307,6 @@ jobs:
 
           project_file = Path(os.environ["PROJECT_FILE"])
           preset_file = Path(os.environ["PRESET_FILE"])
-
-          android_debug_template = os.environ["ANDROID_DEBUG_TEMPLATE"]
-          android_release_template = os.environ["ANDROID_RELEASE_TEMPLATE"]
           debug_keystore = os.environ["DEBUG_KEYSTORE"]
 
           project = project_file.read_text(encoding="utf-8")
@@ -327,32 +357,38 @@ jobs:
               pos = text.index(marker) + len(marker)
               return text[:pos] + f"\n{key}={value}" + text[pos:]
 
-          # نام انگلیسی برای جلوگیری از گیرهای Android label داخل CI
+          # اسم انگلیسی برای جلوگیری از گیرهای Android label در CI
           project = set_project_key(project, "application", 'config/name', '"Jade Bipayan"')
           project = set_project_key(project, "application", 'config/features', 'PackedStringArray("4.3", "Mobile")')
 
-          # بازی 2D است؛ Compatibility کم‌دردسرتر از Mobile renderer در CI است.
+          # برای بازی 2D ساده، compatibility کم‌ریسک‌تر است.
           project = set_project_key(project, "rendering", 'renderer/rendering_method', '"gl_compatibility"')
           project = set_project_key(project, "rendering", 'renderer/rendering_method.mobile', '"gl_compatibility"')
           project = set_project_key(project, "rendering", 'textures/vram_compression/import_etc2_astc', 'false')
 
-          # Android preset: بدون Gradle Build، با template مستقیم و debug keystore مستقیم
-          preset = set_preset_key(preset, 'custom_template/debug', f'"{android_debug_template}"')
-          preset = set_preset_key(preset, 'custom_template/release', f'"{android_release_template}"')
-
-          preset = set_preset_key(preset, 'gradle_build/use_gradle_build', 'false')
-          preset = set_preset_key(preset, 'gradle_build/min_sdk', '""')
-          preset = set_preset_key(preset, 'gradle_build/target_sdk', '""')
+          # مسیر جدید: Gradle Build فعال باشد تا min/target sdk معتبر شوند.
+          preset = set_preset_key(preset, 'gradle_build/use_gradle_build', 'true')
+          preset = set_preset_key(preset, 'gradle_build/gradle_build_directory', '""')
+          preset = set_preset_key(preset, 'gradle_build/android_source_template', '""')
+          preset = set_preset_key(preset, 'gradle_build/compress_native_libraries', 'false')
           preset = set_preset_key(preset, 'gradle_build/export_format', '0')
+          preset = set_preset_key(preset, 'gradle_build/min_sdk', '"24"')
+          preset = set_preset_key(preset, 'gradle_build/target_sdk', '"34"')
 
+          # فعلاً فقط arm64 برای خروجی سبک و سازگار با بازارهای اندرویدی
           preset = set_preset_key(preset, 'architectures/armeabi-v7a', 'false')
           preset = set_preset_key(preset, 'architectures/arm64-v8a', 'true')
           preset = set_preset_key(preset, 'architectures/x86', 'false')
           preset = set_preset_key(preset, 'architectures/x86_64', 'false')
 
+          preset = set_preset_key(preset, 'version/code', '1')
+          preset = set_preset_key(preset, 'version/name', '"1.0.0"')
+
           preset = set_preset_key(preset, 'package/unique_name', '"ir.gamino.jadebipayan"')
           preset = set_preset_key(preset, 'package/name', '"Jade Bipayan"')
           preset = set_preset_key(preset, 'package/signed', 'true')
+          preset = set_preset_key(preset, 'package/app_category', '2')
+          preset = set_preset_key(preset, 'package/retain_data_on_uninstall', 'false')
 
           preset = set_preset_key(preset, 'keystore/debug', f'"{debug_keystore}"')
           preset = set_preset_key(preset, 'keystore/debug_user', '"androiddebugkey"')
@@ -361,7 +397,9 @@ jobs:
           preset = set_preset_key(preset, 'keystore/release_user', '""')
           preset = set_preset_key(preset, 'keystore/release_password', '""')
 
-          # بعضی presetهای قدیمی فیلدهای نامعتبر/حساس دارند؛ برای خروجی ساده خاموش بمانند.
+          preset = set_preset_key(preset, 'custom_template/debug', '""')
+          preset = set_preset_key(preset, 'custom_template/release', '""')
+
           preset = set_preset_key(preset, 'apk_expansion/enable', 'false')
           preset = set_preset_key(preset, 'user_data_backup/allow', 'false')
           preset = set_preset_key(preset, 'screen/immersive_mode', 'true')
@@ -374,40 +412,16 @@ jobs:
           grep -n -A10 '^\[rendering\]' "$PROJECT_FILE" || true
 
           echo "Patched Android preset key lines:"
-          grep -nE 'custom_template/debug|custom_template/release|gradle_build/use_gradle_build|gradle_build/min_sdk|gradle_build/target_sdk|architectures/|package/unique_name|package/name|package/signed|keystore/debug' "$PRESET_FILE" || true
+          grep -nE 'gradle_build/use_gradle_build|gradle_build/min_sdk|gradle_build/target_sdk|architectures/|package/unique_name|package/name|package/signed|keystore/debug|custom_template/debug' "$PRESET_FILE" || true
 
           echo "Available presets:"
           grep -n '^name=' "$PRESET_FILE" || true
         env:
           PROJECT_FILE: ${{ steps.resolve.outputs.project_dir }}/project.godot
           PRESET_FILE: ${{ steps.resolve.outputs.project_dir }}/export_presets.cfg
-          ANDROID_DEBUG_TEMPLATE: ${{ env.GODOT_TEMPLATE_TARGET }}/android_debug.apk
-          ANDROID_RELEASE_TEMPLATE: ${{ env.GODOT_TEMPLATE_TARGET }}/android_release.apk
           DEBUG_KEYSTORE: ${{ env.GODOT_ANDROID_KEYSTORE_DEBUG_PATH }}
 
-      - name: Configure Godot editor settings
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p "$HOME/.config/godot"
-
-          cat > "$HOME/.config/godot/editor_settings-4.tres" <<SETTINGS
-          [gd_resource type="EditorSettings" format=3]
-
-          [resource]
-          export/android/android_sdk_path = "${ANDROID_HOME}"
-          export/android/java_sdk_path = "${JAVA_HOME}"
-          export/android/debug_keystore = "${GODOT_ANDROID_KEYSTORE_DEBUG_PATH}"
-          export/android/debug_keystore_user = "${GODOT_ANDROID_KEYSTORE_DEBUG_USER}"
-          export/android/debug_keystore_pass = "${GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD}"
-          SETTINGS
-
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          echo "JAVA_HOME=$JAVA_HOME"
-          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PATH=$GODOT_ANDROID_KEYSTORE_DEBUG_PATH"
-
-      - name: Warm up Godot project
+      - name: Warm up Godot project once
         shell: bash
         run: |
           set -euo pipefail
@@ -420,6 +434,43 @@ jobs:
             --editor \
             --quit \
             --verbose 2>&1 | tee "$GITHUB_WORKSPACE/godot-warmup.log" || true
+
+      - name: Configure Godot editor settings after warm up
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$HOME/.config/godot"
+
+          for SETTINGS_FILE in "$HOME/.config/godot/editor_settings-4.tres" "$HOME/.config/godot/editor_settings-4.3.tres"; do
+            cat > "$SETTINGS_FILE" <<SETTINGS
+          [gd_resource type="EditorSettings" format=3]
+
+          [resource]
+          export/android/android_sdk_path = "${ANDROID_HOME}"
+          export/android/java_sdk_path = "${JAVA_HOME}"
+          export/android/debug_keystore = "${GODOT_ANDROID_KEYSTORE_DEBUG_PATH}"
+          export/android/debug_keystore_user = "${GODOT_ANDROID_KEYSTORE_DEBUG_USER}"
+          export/android/debug_keystore_pass = "${GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD}"
+          SETTINGS
+
+            echo "Written settings: $SETTINGS_FILE"
+            cat "$SETTINGS_FILE"
+          done
+
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "JAVA_HOME=$JAVA_HOME"
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PATH=$GODOT_ANDROID_KEYSTORE_DEBUG_PATH"
+
+          if [ ! -f "$ANDROID_HOME/platform-tools/adb" ]; then
+            echo "ERROR: adb not found in platform-tools."
+            exit 1
+          fi
+
+          if [ ! -d "$ANDROID_HOME/build-tools" ]; then
+            echo "ERROR: build-tools directory not found."
+            exit 1
+          fi
 
       - name: Build Android APK
         if: ${{ github.event_name == 'push' || inputs.build_android == true }}
@@ -434,7 +485,7 @@ jobs:
 
           mkdir -p "$OUT_DIR"
 
-          echo "Building Android APK..."
+          echo "Building Android APK with Gradle Build Template..."
           echo "Project: $PROJECT_DIR"
           echo "Preset: $ANDROID_PRESET"
           echo "Output: $APK_PATH"
