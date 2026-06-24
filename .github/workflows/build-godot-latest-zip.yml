@@ -29,7 +29,6 @@ concurrency:
 env:
   GODOT_VERSION: "4.3"
   GODOT_STATUS: "stable"
-
   GAME_NAME: "jade-bipayan"
   ANDROID_PRESET: "Android APK Debug"
   WEB_PRESET: "Web"
@@ -129,15 +128,16 @@ jobs:
 
           def version_key(path: Path):
               name = path.stem.lower()
-              matches = re.findall(r"(?:v)?(\d+(?:[._-]\d+){0,6})", name)
+              matches = re.findall(r"(?:v)?(\d+(?:[._-]\d+){0,8})", name)
+
               if matches:
                   last = matches[-1]
                   nums = [int(x) for x in re.split(r"[._-]", last) if x.isdigit()]
               else:
                   nums = []
 
-              nums = nums + [0] * (7 - len(nums))
-              return (tuple(nums[:7]), path.stat().st_mtime, path.name.lower())
+              nums = nums + [0] * (9 - len(nums))
+              return (tuple(nums[:9]), path.stat().st_mtime, path.name.lower())
 
           print(sorted(zips, key=version_key)[-1])
           PY
@@ -161,141 +161,12 @@ jobs:
             exit 1
           fi
 
-          echo "Detected project dir: $PROJECT_DIR"
+          echo "Detected Godot project:"
+          echo "$PROJECT_DIR"
 
           echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
           echo "source_type=zip" >> "$GITHUB_OUTPUT"
           echo "zip_file=$ZIP_FILE" >> "$GITHUB_OUTPUT"
-
-      - name: Patch Godot project for Android CI
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          PROJECT_DIR="${{ steps.resolve.outputs.project_dir }}"
-          PROJECT_FILE="$PROJECT_DIR/project.godot"
-          PRESET_FILE="$PROJECT_DIR/export_presets.cfg"
-
-          echo "Patching Godot project for CI..."
-          echo "Project file: $PROJECT_FILE"
-          echo "Preset file: $PRESET_FILE"
-
-          python3 <<'PY'
-          from pathlib import Path
-          import os
-          import re
-
-          project_file = Path(os.environ["PROJECT_FILE"])
-          preset_file = Path(os.environ["PRESET_FILE"])
-
-          project_text = project_file.read_text(encoding="utf-8")
-          preset_text = preset_file.read_text(encoding="utf-8")
-
-          # برای بازی 2D ساده، compatibility renderer کم‌دردسرتر است
-          # و خطای min sdk مربوط به mobile renderer را حذف می‌کند.
-          if 'renderer/rendering_method=' in project_text:
-              project_text = re.sub(
-                  r'renderer/rendering_method="[^"]*"',
-                  'renderer/rendering_method="gl_compatibility"',
-                  project_text
-              )
-          else:
-              if "[rendering]" not in project_text:
-                  project_text += "\n[rendering]\n"
-              project_text += '\nrenderer/rendering_method="gl_compatibility"\n'
-
-          if 'renderer/rendering_method.mobile=' in project_text:
-              project_text = re.sub(
-                  r'renderer/rendering_method.mobile="[^"]*"',
-                  'renderer/rendering_method.mobile="gl_compatibility"',
-                  project_text
-              )
-          else:
-              if "[rendering]" in project_text:
-                  project_text += 'renderer/rendering_method.mobile="gl_compatibility"\n'
-
-          # در حالت Gradle Build خاموش، نباید min_sdk/target_sdk override شوند.
-          preset_text = re.sub(
-              r'gradle_build/use_gradle_build=(true|false)',
-              'gradle_build/use_gradle_build=false',
-              preset_text
-          )
-
-          preset_text = re.sub(
-              r'gradle_build/min_sdk="[^"]*"',
-              'gradle_build/min_sdk=""',
-              preset_text
-          )
-
-          preset_text = re.sub(
-              r'gradle_build/target_sdk="[^"]*"',
-              'gradle_build/target_sdk=""',
-              preset_text
-          )
-
-          # signing debug با keystore ساخته‌شده در workflow انجام می‌شود.
-          preset_text = re.sub(
-              r'package/signed=(true|false)',
-              'package/signed=true',
-              preset_text
-          )
-
-          project_file.write_text(project_text, encoding="utf-8")
-          preset_file.write_text(preset_text, encoding="utf-8")
-          PY
-
-          echo "Patched rendering section:"
-          grep -n -A8 '^\[rendering\]' "$PROJECT_FILE" || true
-
-          echo "Patched Android preset relevant lines:"
-          grep -nE 'gradle_build/use_gradle_build|gradle_build/min_sdk|gradle_build/target_sdk|package/signed' "$PRESET_FILE" || true
-        env:
-          PROJECT_FILE: ${{ steps.resolve.outputs.project_dir }}/project.godot
-          PRESET_FILE: ${{ steps.resolve.outputs.project_dir }}/export_presets.cfg
-
-      - name: Show export presets
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          PROJECT_DIR="${{ steps.resolve.outputs.project_dir }}"
-
-          echo "Available presets:"
-          grep -n '^name=' "$PROJECT_DIR/export_presets.cfg" || true
-
-          echo "Android preset check:"
-          if ! grep -q "name=\"${ANDROID_PRESET}\"" "$PROJECT_DIR/export_presets.cfg"; then
-            echo "ERROR: Android preset '${ANDROID_PRESET}' not found."
-            exit 1
-          fi
-
-      - name: Create Android debug keystore
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          KEYSTORE_DIR="$GITHUB_WORKSPACE/_godot_keystore"
-          KEYSTORE_PATH="$KEYSTORE_DIR/debug.keystore"
-
-          mkdir -p "$KEYSTORE_DIR"
-
-          keytool -genkeypair \
-            -v \
-            -keystore "$KEYSTORE_PATH" \
-            -storepass android \
-            -alias androiddebugkey \
-            -keypass android \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 10000 \
-            -dname "CN=Android Debug,O=Android,C=US"
-
-          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
-          echo "GODOT_ANDROID_KEYSTORE_DEBUG_USER=androiddebugkey" >> "$GITHUB_ENV"
-          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD=android" >> "$GITHUB_ENV"
-
-          echo "Debug keystore created:"
-          ls -lah "$KEYSTORE_PATH"
 
       - name: Download Godot editor and export templates
         shell: bash
@@ -334,11 +205,185 @@ jobs:
           mkdir -p "$TEMPLATE_TARGET"
           cp -R "$GODOT_DIR/templates_unpack/templates/"* "$TEMPLATE_TARGET/"
 
-          echo "Godot version:"
+          echo "GODOT_BIN=$GODOT_BIN"
           "$GODOT_BIN" --version
 
-          echo "Installed templates:"
+          echo "Template target:"
+          echo "$TEMPLATE_TARGET"
+
+          echo "Templates:"
           ls -lah "$TEMPLATE_TARGET"
+
+          if [ ! -f "$TEMPLATE_TARGET/android_debug.apk" ]; then
+            echo "ERROR: android_debug.apk template not found."
+            exit 1
+          fi
+
+          if [ ! -f "$TEMPLATE_TARGET/android_release.apk" ]; then
+            echo "ERROR: android_release.apk template not found."
+            exit 1
+          fi
+
+          echo "GODOT_TEMPLATE_TARGET=$TEMPLATE_TARGET" >> "$GITHUB_ENV"
+
+      - name: Create Android debug keystore
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          KEYSTORE_DIR="$GITHUB_WORKSPACE/_godot_keystore"
+          KEYSTORE_PATH="$KEYSTORE_DIR/debug.keystore"
+
+          rm -rf "$KEYSTORE_DIR"
+          mkdir -p "$KEYSTORE_DIR"
+
+          keytool -genkeypair \
+            -v \
+            -keystore "$KEYSTORE_PATH" \
+            -storepass android \
+            -alias androiddebugkey \
+            -keypass android \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_USER=androiddebugkey" >> "$GITHUB_ENV"
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD=android" >> "$GITHUB_ENV"
+
+          echo "Debug keystore:"
+          ls -lah "$KEYSTORE_PATH"
+
+      - name: Patch Godot project and export preset
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT_DIR="${{ steps.resolve.outputs.project_dir }}"
+          PROJECT_FILE="$PROJECT_DIR/project.godot"
+          PRESET_FILE="$PROJECT_DIR/export_presets.cfg"
+
+          echo "Project file: $PROJECT_FILE"
+          echo "Preset file: $PRESET_FILE"
+
+          python3 <<'PY'
+          from pathlib import Path
+          import os
+          import re
+
+          project_file = Path(os.environ["PROJECT_FILE"])
+          preset_file = Path(os.environ["PRESET_FILE"])
+
+          android_debug_template = os.environ["ANDROID_DEBUG_TEMPLATE"]
+          android_release_template = os.environ["ANDROID_RELEASE_TEMPLATE"]
+          debug_keystore = os.environ["DEBUG_KEYSTORE"]
+
+          project = project_file.read_text(encoding="utf-8")
+          preset = preset_file.read_text(encoding="utf-8")
+
+          def ensure_section(text: str, section: str) -> str:
+              header = f"[{section}]"
+              if header not in text:
+                  text = text.rstrip() + f"\n\n{header}\n"
+              return text
+
+          def set_project_key(text: str, section: str, key: str, value: str) -> str:
+              text = ensure_section(text, section)
+              header = f"[{section}]"
+              pattern = rf"({re.escape(header)}\n)(.*?)(?=\n\[|\Z)"
+              match = re.search(pattern, text, flags=re.S)
+
+              if not match:
+                  return text
+
+              block = match.group(2)
+
+              if re.search(rf"^{re.escape(key)}=", block, flags=re.M):
+                  block = re.sub(
+                      rf"^{re.escape(key)}=.*$",
+                      f"{key}={value}",
+                      block,
+                      flags=re.M
+                  )
+              else:
+                  block = block.rstrip() + f"\n{key}={value}\n"
+
+              return text[:match.start(2)] + block + text[match.end(2):]
+
+          def set_preset_key(text: str, key: str, value: str) -> str:
+              if re.search(rf"^{re.escape(key)}=", text, flags=re.M):
+                  return re.sub(
+                      rf"^{re.escape(key)}=.*$",
+                      f"{key}={value}",
+                      text,
+                      flags=re.M
+                  )
+
+              marker = "[preset.0.options]"
+              if marker not in text:
+                  raise SystemExit("ERROR: [preset.0.options] not found in export_presets.cfg")
+
+              pos = text.index(marker) + len(marker)
+              return text[:pos] + f"\n{key}={value}" + text[pos:]
+
+          # نام انگلیسی برای جلوگیری از گیرهای Android label داخل CI
+          project = set_project_key(project, "application", 'config/name', '"Jade Bipayan"')
+          project = set_project_key(project, "application", 'config/features', 'PackedStringArray("4.3", "Mobile")')
+
+          # بازی 2D است؛ Compatibility کم‌دردسرتر از Mobile renderer در CI است.
+          project = set_project_key(project, "rendering", 'renderer/rendering_method', '"gl_compatibility"')
+          project = set_project_key(project, "rendering", 'renderer/rendering_method.mobile', '"gl_compatibility"')
+          project = set_project_key(project, "rendering", 'textures/vram_compression/import_etc2_astc', 'false')
+
+          # Android preset: بدون Gradle Build، با template مستقیم و debug keystore مستقیم
+          preset = set_preset_key(preset, 'custom_template/debug', f'"{android_debug_template}"')
+          preset = set_preset_key(preset, 'custom_template/release', f'"{android_release_template}"')
+
+          preset = set_preset_key(preset, 'gradle_build/use_gradle_build', 'false')
+          preset = set_preset_key(preset, 'gradle_build/min_sdk', '""')
+          preset = set_preset_key(preset, 'gradle_build/target_sdk', '""')
+          preset = set_preset_key(preset, 'gradle_build/export_format', '0')
+
+          preset = set_preset_key(preset, 'architectures/armeabi-v7a', 'false')
+          preset = set_preset_key(preset, 'architectures/arm64-v8a', 'true')
+          preset = set_preset_key(preset, 'architectures/x86', 'false')
+          preset = set_preset_key(preset, 'architectures/x86_64', 'false')
+
+          preset = set_preset_key(preset, 'package/unique_name', '"ir.gamino.jadebipayan"')
+          preset = set_preset_key(preset, 'package/name', '"Jade Bipayan"')
+          preset = set_preset_key(preset, 'package/signed', 'true')
+
+          preset = set_preset_key(preset, 'keystore/debug', f'"{debug_keystore}"')
+          preset = set_preset_key(preset, 'keystore/debug_user', '"androiddebugkey"')
+          preset = set_preset_key(preset, 'keystore/debug_password', '"android"')
+          preset = set_preset_key(preset, 'keystore/release', '""')
+          preset = set_preset_key(preset, 'keystore/release_user', '""')
+          preset = set_preset_key(preset, 'keystore/release_password', '""')
+
+          # بعضی presetهای قدیمی فیلدهای نامعتبر/حساس دارند؛ برای خروجی ساده خاموش بمانند.
+          preset = set_preset_key(preset, 'apk_expansion/enable', 'false')
+          preset = set_preset_key(preset, 'user_data_backup/allow', 'false')
+          preset = set_preset_key(preset, 'screen/immersive_mode', 'true')
+
+          project_file.write_text(project, encoding="utf-8")
+          preset_file.write_text(preset, encoding="utf-8")
+          PY
+
+          echo "Patched project rendering:"
+          grep -n -A10 '^\[rendering\]' "$PROJECT_FILE" || true
+
+          echo "Patched Android preset key lines:"
+          grep -nE 'custom_template/debug|custom_template/release|gradle_build/use_gradle_build|gradle_build/min_sdk|gradle_build/target_sdk|architectures/|package/unique_name|package/name|package/signed|keystore/debug' "$PRESET_FILE" || true
+
+          echo "Available presets:"
+          grep -n '^name=' "$PRESET_FILE" || true
+        env:
+          PROJECT_FILE: ${{ steps.resolve.outputs.project_dir }}/project.godot
+          PRESET_FILE: ${{ steps.resolve.outputs.project_dir }}/export_presets.cfg
+          ANDROID_DEBUG_TEMPLATE: ${{ env.GODOT_TEMPLATE_TARGET }}/android_debug.apk
+          ANDROID_RELEASE_TEMPLATE: ${{ env.GODOT_TEMPLATE_TARGET }}/android_release.apk
+          DEBUG_KEYSTORE: ${{ env.GODOT_ANDROID_KEYSTORE_DEBUG_PATH }}
 
       - name: Configure Godot editor settings
         shell: bash
@@ -360,6 +405,7 @@ jobs:
 
           echo "ANDROID_HOME=$ANDROID_HOME"
           echo "JAVA_HOME=$JAVA_HOME"
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PATH=$GODOT_ANDROID_KEYSTORE_DEBUG_PATH"
 
       - name: Warm up Godot project
         shell: bash
@@ -373,7 +419,7 @@ jobs:
             --path "$PROJECT_DIR" \
             --editor \
             --quit \
-            --verbose || true
+            --verbose 2>&1 | tee "$GITHUB_WORKSPACE/godot-warmup.log" || true
 
       - name: Build Android APK
         if: ${{ github.event_name == 'push' || inputs.build_android == true }}
@@ -384,6 +430,7 @@ jobs:
           PROJECT_DIR="${{ steps.resolve.outputs.project_dir }}"
           OUT_DIR="$GITHUB_WORKSPACE/build/android"
           APK_PATH="$OUT_DIR/${GAME_NAME}-${GITHUB_RUN_NUMBER}.apk"
+          LOG_PATH="$GITHUB_WORKSPACE/godot-android-export.log"
 
           mkdir -p "$OUT_DIR"
 
@@ -397,7 +444,7 @@ jobs:
             --verbose \
             --path "$PROJECT_DIR" \
             --export-debug "$ANDROID_PRESET" \
-            "$APK_PATH"
+            "$APK_PATH" 2>&1 | tee "$LOG_PATH"
 
           echo "Android output:"
           ls -lah "$OUT_DIR"
@@ -416,6 +463,7 @@ jobs:
           PROJECT_DIR="${{ steps.resolve.outputs.project_dir }}"
           OUT_DIR="$GITHUB_WORKSPACE/build/web"
           ZIP_OUT="$GITHUB_WORKSPACE/build/${GAME_NAME}-web-${GITHUB_RUN_NUMBER}.zip"
+          LOG_PATH="$GITHUB_WORKSPACE/godot-web-export.log"
 
           mkdir -p "$OUT_DIR"
 
@@ -429,7 +477,7 @@ jobs:
             --verbose \
             --path "$PROJECT_DIR" \
             --export-release "$WEB_PRESET" \
-            "$OUT_DIR/index.html"
+            "$OUT_DIR/index.html" 2>&1 | tee "$LOG_PATH"
 
           cd "$GITHUB_WORKSPACE/build"
           zip -qr "$ZIP_OUT" web
@@ -456,3 +504,15 @@ jobs:
           path: build/*web*.zip
           if-no-files-found: warn
           retention-days: 14
+
+      - name: Upload Godot logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.GAME_NAME }}-godot-logs
+          path: |
+            godot-warmup.log
+            godot-android-export.log
+            godot-web-export.log
+          if-no-files-found: warn
+          retention-days: 7
