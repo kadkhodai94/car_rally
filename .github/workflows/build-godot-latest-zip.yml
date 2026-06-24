@@ -73,7 +73,7 @@ jobs:
           if [ -z "$SDKMANAGER" ]; then
             echo "ERROR: sdkmanager not found."
             echo "ANDROID_HOME=$ANDROID_HOME"
-            find "$ANDROID_HOME" -maxdepth 4 -type f -name sdkmanager || true
+            find "$ANDROID_HOME" -maxdepth 5 -type f -name sdkmanager || true
             exit 1
           fi
 
@@ -81,12 +81,12 @@ jobs:
 
           "$SDKMANAGER" \
             "platform-tools" \
-            "build-tools;35.0.1" \
-            "platforms;android-35" \
+            "build-tools;34.0.0" \
+            "platforms;android-34" \
             "cmdline-tools;latest"
 
           echo "Installed Android SDK packages:"
-          "$SDKMANAGER" --list_installed | head -n 80
+          "$SDKMANAGER" --list_installed | head -n 100
 
       - name: Resolve latest Godot project ZIP
         id: resolve
@@ -129,14 +129,15 @@ jobs:
 
           def version_key(path: Path):
               name = path.stem.lower()
-              matches = re.findall(r"(?:v)?(\d+(?:[._-]\d+){0,5})", name)
+              matches = re.findall(r"(?:v)?(\d+(?:[._-]\d+){0,6})", name)
               if matches:
                   last = matches[-1]
                   nums = [int(x) for x in re.split(r"[._-]", last) if x.isdigit()]
               else:
                   nums = []
-              nums = nums + [0] * (6 - len(nums))
-              return (tuple(nums[:6]), path.stat().st_mtime, path.name.lower())
+
+              nums = nums + [0] * (7 - len(nums))
+              return (tuple(nums[:7]), path.stat().st_mtime, path.name.lower())
 
           print(sorted(zips, key=version_key)[-1])
           PY
@@ -166,38 +167,90 @@ jobs:
           echo "source_type=zip" >> "$GITHUB_OUTPUT"
           echo "zip_file=$ZIP_FILE" >> "$GITHUB_OUTPUT"
 
-      - name: Patch Android export preset for CI
+      - name: Patch Godot project for Android CI
         shell: bash
         run: |
           set -euo pipefail
 
           PROJECT_DIR="${{ steps.resolve.outputs.project_dir }}"
+          PROJECT_FILE="$PROJECT_DIR/project.godot"
           PRESET_FILE="$PROJECT_DIR/export_presets.cfg"
 
-          echo "Patching export_presets.cfg for CI..."
+          echo "Patching Godot project for CI..."
+          echo "Project file: $PROJECT_FILE"
+          echo "Preset file: $PRESET_FILE"
 
           python3 <<'PY'
           from pathlib import Path
           import os
+          import re
 
-          preset = Path(os.environ["PRESET_FILE"])
-          text = preset.read_text(encoding="utf-8")
+          project_file = Path(os.environ["PROJECT_FILE"])
+          preset_file = Path(os.environ["PRESET_FILE"])
 
-          replacements = {
-              'gradle_build/min_sdk=""': 'gradle_build/min_sdk="23"',
-              'gradle_build/target_sdk=""': 'gradle_build/target_sdk="35"',
-              'package/signed=true': 'package/signed=true',
-              'keystore/debug=""': 'keystore/debug=""',
-              'keystore/debug_user=""': 'keystore/debug_user=""',
-              'keystore/debug_password=""': 'keystore/debug_password=""',
-          }
+          project_text = project_file.read_text(encoding="utf-8")
+          preset_text = preset_file.read_text(encoding="utf-8")
 
-          for old, new in replacements.items():
-              text = text.replace(old, new)
+          # برای بازی 2D ساده، compatibility renderer کم‌دردسرتر است
+          # و خطای min sdk مربوط به mobile renderer را حذف می‌کند.
+          if 'renderer/rendering_method=' in project_text:
+              project_text = re.sub(
+                  r'renderer/rendering_method="[^"]*"',
+                  'renderer/rendering_method="gl_compatibility"',
+                  project_text
+              )
+          else:
+              if "[rendering]" not in project_text:
+                  project_text += "\n[rendering]\n"
+              project_text += '\nrenderer/rendering_method="gl_compatibility"\n'
 
-          preset.write_text(text, encoding="utf-8")
+          if 'renderer/rendering_method.mobile=' in project_text:
+              project_text = re.sub(
+                  r'renderer/rendering_method.mobile="[^"]*"',
+                  'renderer/rendering_method.mobile="gl_compatibility"',
+                  project_text
+              )
+          else:
+              if "[rendering]" in project_text:
+                  project_text += 'renderer/rendering_method.mobile="gl_compatibility"\n'
+
+          # در حالت Gradle Build خاموش، نباید min_sdk/target_sdk override شوند.
+          preset_text = re.sub(
+              r'gradle_build/use_gradle_build=(true|false)',
+              'gradle_build/use_gradle_build=false',
+              preset_text
+          )
+
+          preset_text = re.sub(
+              r'gradle_build/min_sdk="[^"]*"',
+              'gradle_build/min_sdk=""',
+              preset_text
+          )
+
+          preset_text = re.sub(
+              r'gradle_build/target_sdk="[^"]*"',
+              'gradle_build/target_sdk=""',
+              preset_text
+          )
+
+          # signing debug با keystore ساخته‌شده در workflow انجام می‌شود.
+          preset_text = re.sub(
+              r'package/signed=(true|false)',
+              'package/signed=true',
+              preset_text
+          )
+
+          project_file.write_text(project_text, encoding="utf-8")
+          preset_file.write_text(preset_text, encoding="utf-8")
           PY
+
+          echo "Patched rendering section:"
+          grep -n -A8 '^\[rendering\]' "$PROJECT_FILE" || true
+
+          echo "Patched Android preset relevant lines:"
+          grep -nE 'gradle_build/use_gradle_build|gradle_build/min_sdk|gradle_build/target_sdk|package/signed' "$PRESET_FILE" || true
         env:
+          PROJECT_FILE: ${{ steps.resolve.outputs.project_dir }}/project.godot
           PRESET_FILE: ${{ steps.resolve.outputs.project_dir }}/export_presets.cfg
 
       - name: Show export presets
@@ -257,6 +310,7 @@ jobs:
           TEMPLATES_TPZ="Godot_v${GODOT_VERSION}-${GODOT_STATUS}_export_templates.tpz"
           RELEASE_URL="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-${GODOT_STATUS}"
 
+          echo "Downloading Godot editor..."
           curl -L --retry 5 --retry-delay 5 "$RELEASE_URL/$GODOT_ZIP" -o "$GODOT_ZIP"
           unzip -q -o "$GODOT_ZIP"
 
@@ -270,6 +324,7 @@ jobs:
           chmod +x "$GODOT_BIN"
           echo "GODOT_BIN=$GODOT_BIN" >> "$GITHUB_ENV"
 
+          echo "Downloading Godot export templates..."
           curl -L --retry 5 --retry-delay 5 "$RELEASE_URL/$TEMPLATES_TPZ" -o "$TEMPLATES_TPZ"
 
           mkdir -p "$GODOT_DIR/templates_unpack"
@@ -279,7 +334,7 @@ jobs:
           mkdir -p "$TEMPLATE_TARGET"
           cp -R "$GODOT_DIR/templates_unpack/templates/"* "$TEMPLATE_TARGET/"
 
-          echo "Godot binary:"
+          echo "Godot version:"
           "$GODOT_BIN" --version
 
           echo "Installed templates:"
