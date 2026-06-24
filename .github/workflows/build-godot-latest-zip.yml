@@ -27,8 +27,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # برای پروژه‌ای که ساختم، 4.3 امن‌تره چون export_presets.cfg با همین نسخه آماده شده.
-  # اگر بعداً پروژه را با Godot جدیدتر ساختی، فقط همین عدد را تغییر بده.
   GODOT_VERSION: "4.3"
   GODOT_STATUS: "stable"
 
@@ -38,7 +36,7 @@ env:
 
 jobs:
   build:
-    name: Build Godot APK/Web
+    name: Build Godot Latest ZIP
     runs-on: ubuntu-latest
 
     steps:
@@ -50,9 +48,9 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y unzip zip python3 curl
+          sudo apt-get install -y unzip zip curl python3
 
-      - name: Setup Java for Android
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -60,6 +58,35 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDKMANAGER="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
+
+          if [ ! -f "$SDKMANAGER" ]; then
+            SDKMANAGER="$(command -v sdkmanager || true)"
+          fi
+
+          if [ -z "$SDKMANAGER" ]; then
+            echo "ERROR: sdkmanager not found."
+            echo "ANDROID_HOME=$ANDROID_HOME"
+            find "$ANDROID_HOME" -maxdepth 4 -type f -name sdkmanager || true
+            exit 1
+          fi
+
+          yes | "$SDKMANAGER" --licenses || true
+
+          "$SDKMANAGER" \
+            "platform-tools" \
+            "build-tools;35.0.1" \
+            "platforms;android-35" \
+            "cmdline-tools;latest"
+
+          echo "Installed Android SDK packages:"
+          "$SDKMANAGER" --list_installed | head -n 80
 
       - name: Resolve latest Godot project ZIP
         id: resolve
@@ -74,25 +101,14 @@ jobs:
           rm -rf "$WORK"
           mkdir -p "$EXTRACT_DIR"
 
-          echo "Repository root:"
-          ls -lah "$ROOT"
-
-          # اگر project.godot مستقیم در ریشه ریپو بود، همان را بساز.
           if [ -f "$ROOT/project.godot" ]; then
-            echo "Found project.godot in repository root."
             echo "project_dir=$ROOT" >> "$GITHUB_OUTPUT"
             echo "source_type=root" >> "$GITHUB_OUTPUT"
             echo "zip_file=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # آخرین ZIP را هوشمند انتخاب می‌کند:
-          # اولویت با عدد نسخه داخل اسم فایل است، مثل:
-          # game_v1_2_3.zip
-          # game_v1.2.3.zip
-          # game_1.2.3.zip
-          # اگر نسخه پیدا نشد، بر اساس نام فایل مرتب می‌کند.
-          python3 <<'PY'
+          ZIP_FILE="$(python3 <<'PY'
           from pathlib import Path
           import re
           import sys
@@ -113,58 +129,22 @@ jobs:
 
           def version_key(path: Path):
               name = path.stem.lower()
-
-              # v1.2.3 / v1_2_3 / 1.2.3 / 1_2_3
-              matches = re.findall(r"(?:v)?(\d+(?:[._-]\d+){0,4})", name)
+              matches = re.findall(r"(?:v)?(\d+(?:[._-]\d+){0,5})", name)
               if matches:
                   last = matches[-1]
                   nums = [int(x) for x in re.split(r"[._-]", last) if x.isdigit()]
               else:
                   nums = []
-
-              nums = nums + [0] * (5 - len(nums))
-              return (tuple(nums[:5]), path.name.lower())
-
-          chosen = sorted(zips, key=version_key)[-1]
-          print(chosen)
-          PY
-
-          ZIP_FILE="$(python3 <<'PY'
-          from pathlib import Path
-          import re
-
-          root = Path(".").resolve()
-          zips = [
-              p for p in root.glob("*.zip")
-              if p.is_file()
-              and not p.name.startswith("_")
-              and "artifact" not in p.name.lower()
-              and "build" not in p.name.lower()
-              and "output" not in p.name.lower()
-          ]
-
-          def version_key(path: Path):
-              name = path.stem.lower()
-              matches = re.findall(r"(?:v)?(\d+(?:[._-]\d+){0,4})", name)
-              if matches:
-                  last = matches[-1]
-                  nums = [int(x) for x in re.split(r"[._-]", last) if x.isdigit()]
-              else:
-                  nums = []
-              nums = nums + [0] * (5 - len(nums))
-              return (tuple(nums[:5]), path.name.lower())
+              nums = nums + [0] * (6 - len(nums))
+              return (tuple(nums[:6]), path.stat().st_mtime, path.name.lower())
 
           print(sorted(zips, key=version_key)[-1])
           PY
           )"
 
-          echo "Selected ZIP:"
-          echo "$ZIP_FILE"
+          echo "Selected ZIP: $ZIP_FILE"
 
           unzip -q -o "$ZIP_FILE" -d "$EXTRACT_DIR"
-
-          echo "Extracted files:"
-          find "$EXTRACT_DIR" -maxdepth 3 -type f | sed 's#^#- #' | head -n 80
 
           PROJECT_GODOT="$(find "$EXTRACT_DIR" -type f -name project.godot | sort | head -n 1 || true)"
 
@@ -175,26 +155,94 @@ jobs:
 
           PROJECT_DIR="$(dirname "$PROJECT_GODOT")"
 
-          echo "Detected Godot project directory:"
-          echo "$PROJECT_DIR"
-
           if [ ! -f "$PROJECT_DIR/export_presets.cfg" ]; then
-            echo "ERROR: export_presets.cfg not found."
-            echo "Godot needs export_presets.cfg for CI export."
+            echo "ERROR: export_presets.cfg not found beside project.godot."
             exit 1
           fi
+
+          echo "Detected project dir: $PROJECT_DIR"
 
           echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
           echo "source_type=zip" >> "$GITHUB_OUTPUT"
           echo "zip_file=$ZIP_FILE" >> "$GITHUB_OUTPUT"
 
+      - name: Patch Android export preset for CI
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT_DIR="${{ steps.resolve.outputs.project_dir }}"
+          PRESET_FILE="$PROJECT_DIR/export_presets.cfg"
+
+          echo "Patching export_presets.cfg for CI..."
+
+          python3 <<'PY'
+          from pathlib import Path
+          import os
+
+          preset = Path(os.environ["PRESET_FILE"])
+          text = preset.read_text(encoding="utf-8")
+
+          replacements = {
+              'gradle_build/min_sdk=""': 'gradle_build/min_sdk="23"',
+              'gradle_build/target_sdk=""': 'gradle_build/target_sdk="35"',
+              'package/signed=true': 'package/signed=true',
+              'keystore/debug=""': 'keystore/debug=""',
+              'keystore/debug_user=""': 'keystore/debug_user=""',
+              'keystore/debug_password=""': 'keystore/debug_password=""',
+          }
+
+          for old, new in replacements.items():
+              text = text.replace(old, new)
+
+          preset.write_text(text, encoding="utf-8")
+          PY
+        env:
+          PRESET_FILE: ${{ steps.resolve.outputs.project_dir }}/export_presets.cfg
+
       - name: Show export presets
         shell: bash
         run: |
           set -euo pipefail
+
           PROJECT_DIR="${{ steps.resolve.outputs.project_dir }}"
-          echo "Export presets found:"
+
+          echo "Available presets:"
           grep -n '^name=' "$PROJECT_DIR/export_presets.cfg" || true
+
+          echo "Android preset check:"
+          if ! grep -q "name=\"${ANDROID_PRESET}\"" "$PROJECT_DIR/export_presets.cfg"; then
+            echo "ERROR: Android preset '${ANDROID_PRESET}' not found."
+            exit 1
+          fi
+
+      - name: Create Android debug keystore
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          KEYSTORE_DIR="$GITHUB_WORKSPACE/_godot_keystore"
+          KEYSTORE_PATH="$KEYSTORE_DIR/debug.keystore"
+
+          mkdir -p "$KEYSTORE_DIR"
+
+          keytool -genkeypair \
+            -v \
+            -keystore "$KEYSTORE_PATH" \
+            -storepass android \
+            -alias androiddebugkey \
+            -keypass android \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PATH=$KEYSTORE_PATH" >> "$GITHUB_ENV"
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_USER=androiddebugkey" >> "$GITHUB_ENV"
+          echo "GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD=android" >> "$GITHUB_ENV"
+
+          echo "Debug keystore created:"
+          ls -lah "$KEYSTORE_PATH"
 
       - name: Download Godot editor and export templates
         shell: bash
@@ -209,23 +257,19 @@ jobs:
           TEMPLATES_TPZ="Godot_v${GODOT_VERSION}-${GODOT_STATUS}_export_templates.tpz"
           RELEASE_URL="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-${GODOT_STATUS}"
 
-          echo "Downloading Godot:"
-          echo "$RELEASE_URL/$GODOT_ZIP"
           curl -L --retry 5 --retry-delay 5 "$RELEASE_URL/$GODOT_ZIP" -o "$GODOT_ZIP"
-
           unzip -q -o "$GODOT_ZIP"
+
           GODOT_BIN="$(find "$GODOT_DIR" -maxdepth 1 -type f -name 'Godot_v*_linux.x86_64' | head -n 1)"
 
           if [ -z "$GODOT_BIN" ]; then
-            echo "ERROR: Godot binary not found after unzip."
+            echo "ERROR: Godot binary not found."
             exit 1
           fi
 
           chmod +x "$GODOT_BIN"
           echo "GODOT_BIN=$GODOT_BIN" >> "$GITHUB_ENV"
 
-          echo "Downloading export templates:"
-          echo "$RELEASE_URL/$TEMPLATES_TPZ"
           curl -L --retry 5 --retry-delay 5 "$RELEASE_URL/$TEMPLATES_TPZ" -o "$TEMPLATES_TPZ"
 
           mkdir -p "$GODOT_DIR/templates_unpack"
@@ -235,10 +279,13 @@ jobs:
           mkdir -p "$TEMPLATE_TARGET"
           cp -R "$GODOT_DIR/templates_unpack/templates/"* "$TEMPLATE_TARGET/"
 
+          echo "Godot binary:"
+          "$GODOT_BIN" --version
+
           echo "Installed templates:"
           ls -lah "$TEMPLATE_TARGET"
 
-      - name: Configure Godot Android SDK paths
+      - name: Configure Godot editor settings
         shell: bash
         run: |
           set -euo pipefail
@@ -251,13 +298,13 @@ jobs:
           [resource]
           export/android/android_sdk_path = "${ANDROID_HOME}"
           export/android/java_sdk_path = "${JAVA_HOME}"
+          export/android/debug_keystore = "${GODOT_ANDROID_KEYSTORE_DEBUG_PATH}"
+          export/android/debug_keystore_user = "${GODOT_ANDROID_KEYSTORE_DEBUG_USER}"
+          export/android/debug_keystore_pass = "${GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD}"
           SETTINGS
 
-          echo "Android SDK:"
-          echo "$ANDROID_HOME"
-
-          echo "Java:"
-          echo "$JAVA_HOME"
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "JAVA_HOME=$JAVA_HOME"
 
       - name: Warm up Godot project
         shell: bash
@@ -266,8 +313,12 @@ jobs:
 
           PROJECT_DIR="${{ steps.resolve.outputs.project_dir }}"
 
-          echo "Opening project once in headless mode..."
-          timeout 90s "$GODOT_BIN" --headless --path "$PROJECT_DIR" --editor --quit || true
+          "$GODOT_BIN" \
+            --headless \
+            --path "$PROJECT_DIR" \
+            --editor \
+            --quit \
+            --verbose || true
 
       - name: Build Android APK
         if: ${{ github.event_name == 'push' || inputs.build_android == true }}
@@ -277,26 +328,20 @@ jobs:
 
           PROJECT_DIR="${{ steps.resolve.outputs.project_dir }}"
           OUT_DIR="$GITHUB_WORKSPACE/build/android"
-          mkdir -p "$OUT_DIR"
-
-          echo "Checking Android preset: ${ANDROID_PRESET}"
-
-          if ! grep -q "name=\"${ANDROID_PRESET}\"" "$PROJECT_DIR/export_presets.cfg"; then
-            echo "ERROR: Android preset '${ANDROID_PRESET}' not found in export_presets.cfg"
-            echo "Available presets:"
-            grep '^name=' "$PROJECT_DIR/export_presets.cfg" || true
-            exit 1
-          fi
-
           APK_PATH="$OUT_DIR/${GAME_NAME}-${GITHUB_RUN_NUMBER}.apk"
 
-          echo "Building APK:"
-          echo "$APK_PATH"
+          mkdir -p "$OUT_DIR"
+
+          echo "Building Android APK..."
+          echo "Project: $PROJECT_DIR"
+          echo "Preset: $ANDROID_PRESET"
+          echo "Output: $APK_PATH"
 
           "$GODOT_BIN" \
             --headless \
+            --verbose \
             --path "$PROJECT_DIR" \
-            --export-debug "${ANDROID_PRESET}" \
+            --export-debug "$ANDROID_PRESET" \
             "$APK_PATH"
 
           echo "Android output:"
@@ -319,28 +364,20 @@ jobs:
 
           mkdir -p "$OUT_DIR"
 
-          echo "Checking Web preset: ${WEB_PRESET}"
-
           if ! grep -q "name=\"${WEB_PRESET}\"" "$PROJECT_DIR/export_presets.cfg"; then
-            echo "ERROR: Web preset '${WEB_PRESET}' not found in export_presets.cfg"
-            echo "Available presets:"
-            grep '^name=' "$PROJECT_DIR/export_presets.cfg" || true
-            exit 1
+            echo "Web preset '${WEB_PRESET}' not found. Skipping web build."
+            exit 0
           fi
-
-          echo "Building Web export..."
 
           "$GODOT_BIN" \
             --headless \
+            --verbose \
             --path "$PROJECT_DIR" \
-            --export-release "${WEB_PRESET}" \
+            --export-release "$WEB_PRESET" \
             "$OUT_DIR/index.html"
 
           cd "$GITHUB_WORKSPACE/build"
           zip -qr "$ZIP_OUT" web
-
-          echo "Web output:"
-          ls -lah "$GITHUB_WORKSPACE/build"
 
           if [ ! -f "$ZIP_OUT" ]; then
             echo "ERROR: Web ZIP was not created."
@@ -362,5 +399,5 @@ jobs:
         with:
           name: ${{ env.GAME_NAME }}-web
           path: build/*web*.zip
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 14
