@@ -1,0 +1,366 @@
+name: Build Godot Latest ZIP
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_android:
+        description: "Build Android APK"
+        required: true
+        default: true
+        type: boolean
+      build_web:
+        description: "Build Web ZIP"
+        required: true
+        default: true
+        type: boolean
+
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: godot-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # برای پروژه‌ای که ساختم، 4.3 امن‌تره چون export_presets.cfg با همین نسخه آماده شده.
+  # اگر بعداً پروژه را با Godot جدیدتر ساختی، فقط همین عدد را تغییر بده.
+  GODOT_VERSION: "4.3"
+  GODOT_STATUS: "stable"
+
+  GAME_NAME: "jade-bipayan"
+  ANDROID_PRESET: "Android APK Debug"
+  WEB_PRESET: "Web"
+
+jobs:
+  build:
+    name: Build Godot APK/Web
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y unzip zip python3 curl
+
+      - name: Setup Java for Android
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Resolve latest Godot project ZIP
+        id: resolve
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROOT="$GITHUB_WORKSPACE"
+          WORK="$ROOT/_godot_ci"
+          EXTRACT_DIR="$WORK/extracted"
+
+          rm -rf "$WORK"
+          mkdir -p "$EXTRACT_DIR"
+
+          echo "Repository root:"
+          ls -lah "$ROOT"
+
+          # اگر project.godot مستقیم در ریشه ریپو بود، همان را بساز.
+          if [ -f "$ROOT/project.godot" ]; then
+            echo "Found project.godot in repository root."
+            echo "project_dir=$ROOT" >> "$GITHUB_OUTPUT"
+            echo "source_type=root" >> "$GITHUB_OUTPUT"
+            echo "zip_file=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # آخرین ZIP را هوشمند انتخاب می‌کند:
+          # اولویت با عدد نسخه داخل اسم فایل است، مثل:
+          # game_v1_2_3.zip
+          # game_v1.2.3.zip
+          # game_1.2.3.zip
+          # اگر نسخه پیدا نشد، بر اساس نام فایل مرتب می‌کند.
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          root = Path(".").resolve()
+          zips = [
+              p for p in root.glob("*.zip")
+              if p.is_file()
+              and not p.name.startswith("_")
+              and "artifact" not in p.name.lower()
+              and "build" not in p.name.lower()
+              and "output" not in p.name.lower()
+          ]
+
+          if not zips:
+              print("ERROR: No ZIP file found in repository root.", file=sys.stderr)
+              sys.exit(1)
+
+          def version_key(path: Path):
+              name = path.stem.lower()
+
+              # v1.2.3 / v1_2_3 / 1.2.3 / 1_2_3
+              matches = re.findall(r"(?:v)?(\d+(?:[._-]\d+){0,4})", name)
+              if matches:
+                  last = matches[-1]
+                  nums = [int(x) for x in re.split(r"[._-]", last) if x.isdigit()]
+              else:
+                  nums = []
+
+              nums = nums + [0] * (5 - len(nums))
+              return (tuple(nums[:5]), path.name.lower())
+
+          chosen = sorted(zips, key=version_key)[-1]
+          print(chosen)
+          PY
+
+          ZIP_FILE="$(python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          root = Path(".").resolve()
+          zips = [
+              p for p in root.glob("*.zip")
+              if p.is_file()
+              and not p.name.startswith("_")
+              and "artifact" not in p.name.lower()
+              and "build" not in p.name.lower()
+              and "output" not in p.name.lower()
+          ]
+
+          def version_key(path: Path):
+              name = path.stem.lower()
+              matches = re.findall(r"(?:v)?(\d+(?:[._-]\d+){0,4})", name)
+              if matches:
+                  last = matches[-1]
+                  nums = [int(x) for x in re.split(r"[._-]", last) if x.isdigit()]
+              else:
+                  nums = []
+              nums = nums + [0] * (5 - len(nums))
+              return (tuple(nums[:5]), path.name.lower())
+
+          print(sorted(zips, key=version_key)[-1])
+          PY
+          )"
+
+          echo "Selected ZIP:"
+          echo "$ZIP_FILE"
+
+          unzip -q -o "$ZIP_FILE" -d "$EXTRACT_DIR"
+
+          echo "Extracted files:"
+          find "$EXTRACT_DIR" -maxdepth 3 -type f | sed 's#^#- #' | head -n 80
+
+          PROJECT_GODOT="$(find "$EXTRACT_DIR" -type f -name project.godot | sort | head -n 1 || true)"
+
+          if [ -z "$PROJECT_GODOT" ]; then
+            echo "ERROR: project.godot not found inside selected ZIP."
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$PROJECT_GODOT")"
+
+          echo "Detected Godot project directory:"
+          echo "$PROJECT_DIR"
+
+          if [ ! -f "$PROJECT_DIR/export_presets.cfg" ]; then
+            echo "ERROR: export_presets.cfg not found."
+            echo "Godot needs export_presets.cfg for CI export."
+            exit 1
+          fi
+
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "source_type=zip" >> "$GITHUB_OUTPUT"
+          echo "zip_file=$ZIP_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Show export presets
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROJECT_DIR="${{ steps.resolve.outputs.project_dir }}"
+          echo "Export presets found:"
+          grep -n '^name=' "$PROJECT_DIR/export_presets.cfg" || true
+
+      - name: Download Godot editor and export templates
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          GODOT_DIR="$GITHUB_WORKSPACE/_godot_engine"
+          mkdir -p "$GODOT_DIR"
+          cd "$GODOT_DIR"
+
+          GODOT_ZIP="Godot_v${GODOT_VERSION}-${GODOT_STATUS}_linux.x86_64.zip"
+          TEMPLATES_TPZ="Godot_v${GODOT_VERSION}-${GODOT_STATUS}_export_templates.tpz"
+          RELEASE_URL="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-${GODOT_STATUS}"
+
+          echo "Downloading Godot:"
+          echo "$RELEASE_URL/$GODOT_ZIP"
+          curl -L --retry 5 --retry-delay 5 "$RELEASE_URL/$GODOT_ZIP" -o "$GODOT_ZIP"
+
+          unzip -q -o "$GODOT_ZIP"
+          GODOT_BIN="$(find "$GODOT_DIR" -maxdepth 1 -type f -name 'Godot_v*_linux.x86_64' | head -n 1)"
+
+          if [ -z "$GODOT_BIN" ]; then
+            echo "ERROR: Godot binary not found after unzip."
+            exit 1
+          fi
+
+          chmod +x "$GODOT_BIN"
+          echo "GODOT_BIN=$GODOT_BIN" >> "$GITHUB_ENV"
+
+          echo "Downloading export templates:"
+          echo "$RELEASE_URL/$TEMPLATES_TPZ"
+          curl -L --retry 5 --retry-delay 5 "$RELEASE_URL/$TEMPLATES_TPZ" -o "$TEMPLATES_TPZ"
+
+          mkdir -p "$GODOT_DIR/templates_unpack"
+          unzip -q -o "$TEMPLATES_TPZ" -d "$GODOT_DIR/templates_unpack"
+
+          TEMPLATE_TARGET="$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.${GODOT_STATUS}"
+          mkdir -p "$TEMPLATE_TARGET"
+          cp -R "$GODOT_DIR/templates_unpack/templates/"* "$TEMPLATE_TARGET/"
+
+          echo "Installed templates:"
+          ls -lah "$TEMPLATE_TARGET"
+
+      - name: Configure Godot Android SDK paths
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$HOME/.config/godot"
+
+          cat > "$HOME/.config/godot/editor_settings-4.tres" <<SETTINGS
+          [gd_resource type="EditorSettings" format=3]
+
+          [resource]
+          export/android/android_sdk_path = "${ANDROID_HOME}"
+          export/android/java_sdk_path = "${JAVA_HOME}"
+          SETTINGS
+
+          echo "Android SDK:"
+          echo "$ANDROID_HOME"
+
+          echo "Java:"
+          echo "$JAVA_HOME"
+
+      - name: Warm up Godot project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT_DIR="${{ steps.resolve.outputs.project_dir }}"
+
+          echo "Opening project once in headless mode..."
+          timeout 90s "$GODOT_BIN" --headless --path "$PROJECT_DIR" --editor --quit || true
+
+      - name: Build Android APK
+        if: ${{ github.event_name == 'push' || inputs.build_android == true }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT_DIR="${{ steps.resolve.outputs.project_dir }}"
+          OUT_DIR="$GITHUB_WORKSPACE/build/android"
+          mkdir -p "$OUT_DIR"
+
+          echo "Checking Android preset: ${ANDROID_PRESET}"
+
+          if ! grep -q "name=\"${ANDROID_PRESET}\"" "$PROJECT_DIR/export_presets.cfg"; then
+            echo "ERROR: Android preset '${ANDROID_PRESET}' not found in export_presets.cfg"
+            echo "Available presets:"
+            grep '^name=' "$PROJECT_DIR/export_presets.cfg" || true
+            exit 1
+          fi
+
+          APK_PATH="$OUT_DIR/${GAME_NAME}-${GITHUB_RUN_NUMBER}.apk"
+
+          echo "Building APK:"
+          echo "$APK_PATH"
+
+          "$GODOT_BIN" \
+            --headless \
+            --path "$PROJECT_DIR" \
+            --export-debug "${ANDROID_PRESET}" \
+            "$APK_PATH"
+
+          echo "Android output:"
+          ls -lah "$OUT_DIR"
+
+          if [ ! -f "$APK_PATH" ]; then
+            echo "ERROR: APK was not created."
+            exit 1
+          fi
+
+      - name: Build Web ZIP
+        if: ${{ github.event_name == 'push' || inputs.build_web == true }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT_DIR="${{ steps.resolve.outputs.project_dir }}"
+          OUT_DIR="$GITHUB_WORKSPACE/build/web"
+          ZIP_OUT="$GITHUB_WORKSPACE/build/${GAME_NAME}-web-${GITHUB_RUN_NUMBER}.zip"
+
+          mkdir -p "$OUT_DIR"
+
+          echo "Checking Web preset: ${WEB_PRESET}"
+
+          if ! grep -q "name=\"${WEB_PRESET}\"" "$PROJECT_DIR/export_presets.cfg"; then
+            echo "ERROR: Web preset '${WEB_PRESET}' not found in export_presets.cfg"
+            echo "Available presets:"
+            grep '^name=' "$PROJECT_DIR/export_presets.cfg" || true
+            exit 1
+          fi
+
+          echo "Building Web export..."
+
+          "$GODOT_BIN" \
+            --headless \
+            --path "$PROJECT_DIR" \
+            --export-release "${WEB_PRESET}" \
+            "$OUT_DIR/index.html"
+
+          cd "$GITHUB_WORKSPACE/build"
+          zip -qr "$ZIP_OUT" web
+
+          echo "Web output:"
+          ls -lah "$GITHUB_WORKSPACE/build"
+
+          if [ ! -f "$ZIP_OUT" ]; then
+            echo "ERROR: Web ZIP was not created."
+            exit 1
+          fi
+
+      - name: Upload Android APK artifact
+        if: ${{ github.event_name == 'push' || inputs.build_android == true }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.GAME_NAME }}-android-apk
+          path: build/android/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Web artifact
+        if: ${{ github.event_name == 'push' || inputs.build_web == true }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.GAME_NAME }}-web
+          path: build/*web*.zip
+          if-no-files-found: error
+          retention-days: 14
