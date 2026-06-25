@@ -9,10 +9,11 @@ on:
         default: true
         type: boolean
       build_web:
-        description: "Build Web ZIP"
+        description: "Build Web"
         required: true
         default: true
         type: boolean
+
   push:
     branches:
       - main
@@ -35,6 +36,7 @@ jobs:
   build:
     name: Build Godot APK/Web with Docker CI
     runs-on: ubuntu-22.04
+
     container:
       image: barichello/godot-ci:4.3
 
@@ -63,42 +65,33 @@ jobs:
             exit 0
           fi
 
-          ZIP_FILE="$(python3 <<'PY'
-          from pathlib import Path
-          import re
-          import sys
-
-          root = Path('.').resolve()
-          zips = [
-              p for p in root.glob('*.zip')
-              if p.is_file()
-              and not p.name.startswith('_')
-              and 'artifact' not in p.name.lower()
-              and 'build' not in p.name.lower()
-              and 'output' not in p.name.lower()
-          ]
-
-          if not zips:
-              print('ERROR: No ZIP file found in repository root.', file=sys.stderr)
-              sys.exit(1)
-
-          def version_key(path: Path):
-              name = path.stem.lower()
-              matches = re.findall(r'(?:v)?(\d+(?:[._-]\d+){0,10})', name)
-              nums = []
-              if matches:
-                  nums = [int(x) for x in re.split(r'[._-]', matches[-1]) if x.isdigit()]
-              nums = nums + [0] * (11 - len(nums))
-              return (tuple(nums[:11]), path.stat().st_mtime, path.name.lower())
-
-          print(sorted(zips, key=version_key)[-1])
-          PY
+          ZIP_FILE="$(
+            find "$ROOT" -maxdepth 1 -type f -name "*.zip" \
+              ! -name "_*" \
+              ! -iname "*artifact*" \
+              ! -iname "*build*" \
+              ! -iname "*output*" \
+              -printf "%f\n" \
+              | sort -V \
+              | tail -n 1
           )"
 
-          echo "Selected ZIP: $ZIP_FILE"
-          unzip -q -o "$ZIP_FILE" -d "$EXTRACT_DIR"
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERROR: No ZIP file found in repository root."
+            exit 1
+          fi
 
-          PROJECT_GODOT="$(find "$EXTRACT_DIR" -type f -name project.godot | sort | head -n 1 || true)"
+          ZIP_PATH="$ROOT/$ZIP_FILE"
+
+          echo "Selected ZIP: $ZIP_PATH"
+
+          unzip -q -o "$ZIP_PATH" -d "$EXTRACT_DIR"
+
+          PROJECT_GODOT="$(
+            find "$EXTRACT_DIR" -type f -name project.godot \
+              | sort \
+              | head -n 1
+          )"
 
           if [ -z "$PROJECT_GODOT" ]; then
             echo "ERROR: project.godot not found inside selected ZIP."
@@ -107,44 +100,37 @@ jobs:
 
           PROJECT_DIR="$(dirname "$PROJECT_GODOT")"
 
-          if [ ! -f "$PROJECT_DIR/export_presets.cfg" ]; then
-            echo "ERROR: export_presets.cfg not found beside project.godot."
-            exit 1
-          fi
-
           echo "Detected project: $PROJECT_DIR"
+
           echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
-          echo "zip_file=$ZIP_FILE" >> "$GITHUB_OUTPUT"
+          echo "zip_file=$ZIP_PATH" >> "$GITHUB_OUTPUT"
 
       - name: Setup Godot CI paths
         shell: bash
         run: |
           set -euo pipefail
 
+          mkdir -p "$HOME/.config/godot"
           mkdir -p "$HOME/.local/share/godot/export_templates"
-          mkdir -p "$HOME/.config"
 
           if [ -d "/root/.config/godot" ]; then
             rm -rf "$HOME/.config/godot"
             cp -R "/root/.config/godot" "$HOME/.config/godot"
-          else
-            mkdir -p "$HOME/.config/godot"
           fi
 
           if [ -d "/root/.local/share/godot/export_templates/${GODOT_VERSION}.stable" ]; then
             rm -rf "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
             cp -R "/root/.local/share/godot/export_templates/${GODOT_VERSION}.stable" "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
-          elif [ -d "/root/.local/share/godot/templates/${GODOT_VERSION}.stable" ]; then
-            rm -rf "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
-            cp -R "/root/.local/share/godot/templates/${GODOT_VERSION}.stable" "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
           fi
 
           JAVA_PATH="/usr/lib/jvm/java-17-openjdk-amd64"
+
           if [ ! -d "$JAVA_PATH" ]; then
             JAVA_PATH="$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")"
           fi
 
           ANDROID_PATH="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+
           if [ -z "$ANDROID_PATH" ]; then
             for candidate in /opt/android-sdk /root/android-sdk /usr/lib/android-sdk /android-sdk; do
               if [ -d "$candidate" ]; then
@@ -156,25 +142,36 @@ jobs:
 
           if [ -z "$ANDROID_PATH" ]; then
             echo "ERROR: Android SDK path was not found inside Docker image."
-            find / -maxdepth 3 -type d -iname '*android*' 2>/dev/null | head -n 80 || true
+            find / -maxdepth 4 -type d -iname "*android*" 2>/dev/null | head -n 80 || true
             exit 1
           fi
 
-          export ANDROID_HOME="$ANDROID_PATH"
-          export ANDROID_SDK_ROOT="$ANDROID_PATH"
-          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$ANDROID_PATH" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_PATH" >> "$GITHUB_ENV"
           echo "JAVA_HOME=$JAVA_PATH" >> "$GITHUB_ENV"
 
           SETTINGS_FILE="$HOME/.config/godot/editor_settings-4.3.tres"
-          touch "$SETTINGS_FILE"
-          grep -q '^export/android/android_sdk_path' "$SETTINGS_FILE" || echo "export/android/android_sdk_path = \"$ANDROID_HOME\"" >> "$SETTINGS_FILE"
-          grep -q '^export/android/java_sdk_path' "$SETTINGS_FILE" || echo "export/android/java_sdk_path = \"$JAVA_PATH\"" >> "$SETTINGS_FILE"
+
+          cat > "$SETTINGS_FILE" <<SETTINGS
+          [gd_resource type="EditorSettings" format=3]
+
+          [resource]
+          export/android/android_sdk_path = "$ANDROID_PATH"
+          export/android/java_sdk_path = "$JAVA_PATH"
+          SETTINGS
 
           echo "Godot version:"
           godot --version
-          echo "Java: $JAVA_PATH"
-          echo "Android SDK: $ANDROID_HOME"
+
+          echo "Java path:"
+          echo "$JAVA_PATH"
+
+          echo "Android SDK:"
+          echo "$ANDROID_PATH"
+
+          echo "Editor settings:"
+          cat "$SETTINGS_FILE"
+
           echo "Export templates:"
           ls -lah "$HOME/.local/share/godot/export_templates" || true
           ls -lah "$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable" || true
@@ -208,10 +205,43 @@ jobs:
 
           ls -lah "$KEYSTORE_PATH"
 
+      - name: Normalize project files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT_DIR="${{ steps.resolve.outputs.project_dir }}"
+          PROJECT_FILE="$PROJECT_DIR/project.godot"
+
+          if [ ! -f "$PROJECT_FILE" ]; then
+            echo "ERROR: project.godot not found."
+            exit 1
+          fi
+
+          if grep -q '^config/name=' "$PROJECT_FILE"; then
+            sed -i 's#^config/name=.*#config/name="Jade Bipayan"#' "$PROJECT_FILE"
+          fi
+
+          if grep -q '^run/main_scene=' "$PROJECT_FILE"; then
+            sed -i 's#^run/main_scene=.*#run/main_scene="res://scenes/Main.tscn"#' "$PROJECT_FILE"
+          fi
+
+          if grep -q '^renderer/rendering_method=' "$PROJECT_FILE"; then
+            sed -i 's#^renderer/rendering_method=.*#renderer/rendering_method="gl_compatibility"#' "$PROJECT_FILE"
+          fi
+
+          if grep -q '^renderer/rendering_method.mobile=' "$PROJECT_FILE"; then
+            sed -i 's#^renderer/rendering_method.mobile=.*#renderer/rendering_method.mobile="gl_compatibility"#' "$PROJECT_FILE"
+          fi
+
+          echo "Project file normalized."
+          grep -nE 'config/name|run/main_scene|renderer/rendering_method' "$PROJECT_FILE" || true
+
       - name: Warm up project import
         shell: bash
         run: |
           set -euo pipefail
+
           PROJECT_DIR="${{ steps.resolve.outputs.project_dir }}"
 
           godot \
@@ -221,10 +251,11 @@ jobs:
             --quit \
             --verbose 2>&1 | tee "$GITHUB_WORKSPACE/godot-warmup.log" || true
 
-      - name: Patch Android credentials after warm up
+      - name: Write clean export presets and credentials
         shell: bash
         run: |
           set -euo pipefail
+
           PROJECT_DIR="${{ steps.resolve.outputs.project_dir }}"
           PRESET_FILE="$PROJECT_DIR/export_presets.cfg"
           CREDENTIALS_DIR="$PROJECT_DIR/.godot"
@@ -232,39 +263,122 @@ jobs:
 
           mkdir -p "$CREDENTIALS_DIR"
 
-          python3 <<'PY'
-          from pathlib import Path
-          import os
-          import re
+          cat > "$PRESET_FILE" <<EOF
+          [preset.0]
 
-          preset_file = Path(os.environ['PRESET_FILE'])
-          text = preset_file.read_text(encoding='utf-8')
-          debug_keystore = os.environ['DEBUG_KEYSTORE']
+          name="Android"
+          platform="Android"
+          runnable=true
+          dedicated_server=false
+          custom_features=""
+          export_filter="all_resources"
+          include_filter=""
+          exclude_filter=""
+          export_path="build/android/jade-bipayan.apk"
+          encryption_include_filters=""
+          encryption_exclude_filters=""
+          encrypt_pck=false
+          encrypt_directory=false
+          script_export_mode=2
 
-          def set_key(text: str, key: str, value: str) -> str:
-              if re.search(rf'^{re.escape(key)}=', text, flags=re.M):
-                  return re.sub(rf'^{re.escape(key)}=.*$', f'{key}={value}', text, flags=re.M)
-              marker = '[preset.0.options]'
-              if marker not in text:
-                  raise SystemExit('ERROR: [preset.0.options] not found in export_presets.cfg')
-              pos = text.index(marker) + len(marker)
-              return text[:pos] + f'\n{key}={value}' + text[pos:]
+          [preset.0.options]
 
-          text = set_key(text, 'gradle_build/use_gradle_build', 'false')
-          text = set_key(text, 'gradle_build/min_sdk', '""')
-          text = set_key(text, 'gradle_build/target_sdk', '""')
-          text = set_key(text, 'package/signed', 'true')
-          text = set_key(text, 'package/show_as_launcher_app', 'true')
-          text = set_key(text, 'keystore/debug', f'"{debug_keystore}"')
-          text = set_key(text, 'keystore/debug_user', '"androiddebugkey"')
-          text = set_key(text, 'keystore/debug_password', '"android"')
-          text = set_key(text, 'keystore/release', '""')
-          text = set_key(text, 'keystore/release_user', '""')
-          text = set_key(text, 'keystore/release_password', '""')
-          preset_file.write_text(text, encoding='utf-8')
-          PY
+          custom_template/debug=""
+          custom_template/release=""
+          gradle_build/use_gradle_build=false
+          gradle_build/gradle_build_directory=""
+          gradle_build/android_source_template=""
+          gradle_build/compress_native_libraries=false
+          gradle_build/export_format=0
+          gradle_build/min_sdk=""
+          gradle_build/target_sdk=""
+          gradle_build/custom_theme_attributes={}
+          architectures/armeabi-v7a=false
+          architectures/arm64-v8a=true
+          architectures/x86=false
+          architectures/x86_64=false
+          version/code=3
+          version/name="1.2.1"
+          package/unique_name="ir.gamino.jadebipayan"
+          package/name="Jade Bipayan"
+          package/signed=true
+          package/app_category=2
+          package/retain_data_on_uninstall=false
+          package/exclude_from_recents=false
+          package/show_in_android_tv=false
+          package/show_in_app_library=true
+          package/show_as_launcher_app=true
+          keystore/debug="$DEBUG_KEYSTORE"
+          keystore/debug_user="androiddebugkey"
+          keystore/debug_password="android"
+          keystore/release=""
+          keystore/release_user=""
+          keystore/release_password=""
+          launcher_icons/main_192x192=""
+          launcher_icons/adaptive_foreground_432x432=""
+          launcher_icons/adaptive_background_432x432=""
+          launcher_icons/adaptive_monochrome_432x432=""
+          graphics/opengl_debug=false
+          xr_features/xr_mode=0
+          screen/immersive_mode=true
+          screen/support_small=true
+          screen/support_normal=true
+          screen/support_large=true
+          screen/support_xlarge=true
+          user_data_backup/allow=false
+          command_line/extra_args=""
+          apk_expansion/enable=false
+          apk_expansion/SALT=""
+          apk_expansion/public_key=""
+          permissions/custom_permissions=PackedStringArray()
+          permissions/access_network_state=false
+          permissions/internet=false
+          permissions/post_notifications=false
+          permissions/vibrate=false
+          permissions/wake_lock=false
 
-          cat > "$CREDENTIALS_FILE" <<CREDENTIALS
+          [preset.1]
+
+          name="Web"
+          platform="Web"
+          runnable=true
+          dedicated_server=false
+          custom_features=""
+          export_filter="all_resources"
+          include_filter=""
+          exclude_filter=""
+          export_path="build/web/index.html"
+          encryption_include_filters=""
+          encryption_exclude_filters=""
+          encrypt_pck=false
+          encrypt_directory=false
+          script_export_mode=2
+
+          [preset.1.options]
+
+          custom_template/debug=""
+          custom_template/release=""
+          variant/extensions_support=false
+          vram_texture_compression/for_desktop=true
+          vram_texture_compression/for_mobile=false
+          html/export_icon=true
+          html/custom_html_shell=""
+          html/head_include=""
+          html/canvas_resize_policy=2
+          html/focus_canvas_on_start=true
+          html/experimental_virtual_keyboard=false
+          progressive_web_app/enabled=false
+          progressive_web_app/offline_page=""
+          progressive_web_app/display=1
+          progressive_web_app/orientation=0
+          progressive_web_app/icon_144x144=""
+          progressive_web_app/icon_180x180=""
+          progressive_web_app/icon_512x512=""
+          EOF
+
+          sed -i 's/^          //' "$PRESET_FILE"
+
+          cat > "$CREDENTIALS_FILE" <<EOF
           [preset.0]
 
           keystore/debug="$DEBUG_KEYSTORE"
@@ -273,20 +387,22 @@ jobs:
           keystore/release=""
           keystore/release_user=""
           keystore/release_password=""
-          CREDENTIALS
+          EOF
 
-          echo "Final Android preset signing lines:"
-          grep -nE 'name=|platform=|gradle_build|package/unique_name|package/name|package/signed|package/show_as_launcher_app|keystore/debug|keystore/release|architectures' "$PRESET_FILE" || true
-          echo "Export credentials file:"
+          sed -i 's/^          //' "$CREDENTIALS_FILE"
+
+          echo "Final export presets:"
+          sed -n '1,130p' "$PRESET_FILE"
+
+          echo "Export credentials:"
           cat "$CREDENTIALS_FILE"
-        env:
-          PRESET_FILE: ${{ steps.resolve.outputs.project_dir }}/export_presets.cfg
 
       - name: Build Android APK
         if: ${{ github.event_name == 'push' || inputs.build_android == true }}
         shell: bash
         run: |
           set -euo pipefail
+
           PROJECT_DIR="${{ steps.resolve.outputs.project_dir }}"
           OUT_DIR="$GITHUB_WORKSPACE/build/android"
           APK_PATH="$OUT_DIR/${EXPORT_NAME}-${GITHUB_RUN_NUMBER}.apk"
@@ -302,16 +418,17 @@ jobs:
             "$APK_PATH" 2>&1 | tee "$LOG_PATH"
 
           test -f "$APK_PATH"
+
           ls -lah "$OUT_DIR"
 
-      - name: Build Web ZIP
+      - name: Build Web
         if: ${{ github.event_name == 'push' || inputs.build_web == true }}
         shell: bash
         run: |
           set -euo pipefail
+
           PROJECT_DIR="${{ steps.resolve.outputs.project_dir }}"
           OUT_DIR="$GITHUB_WORKSPACE/build/web"
-          ZIP_OUT="$GITHUB_WORKSPACE/build/${EXPORT_NAME}-web-${GITHUB_RUN_NUMBER}.zip"
           LOG_PATH="$GITHUB_WORKSPACE/godot-web-export.log"
 
           mkdir -p "$OUT_DIR"
@@ -323,9 +440,9 @@ jobs:
             --export-release "$WEB_PRESET" \
             "$OUT_DIR/index.html" 2>&1 | tee "$LOG_PATH"
 
-          cd "$GITHUB_WORKSPACE/build"
-          zip -qr "$ZIP_OUT" web
-          test -f "$ZIP_OUT"
+          test -f "$OUT_DIR/index.html"
+
+          ls -lah "$OUT_DIR"
 
       - name: Upload Android APK artifact
         if: ${{ github.event_name == 'push' || inputs.build_android == true }}
@@ -341,7 +458,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.EXPORT_NAME }}-web
-          path: build/*web*.zip
+          path: build/web
           if-no-files-found: warn
           retention-days: 14
 
